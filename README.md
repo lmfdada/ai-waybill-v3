@@ -16,10 +16,14 @@ npm run dev
 ```bash
 V2_API_BASE_URL=http://localhost:3001
 V2_API_KEY=dev-v2-api-key
-V3_API_KEY=dev-v3-api-key
+DATABASE_URL=postgresql://...
+V3_JOB_TOKEN=dev-v3-job-token
+AI_API_KEY=optional
+AI_BASE_URL=https://api.deepseek.com/v1/chat/completions
+AI_MODEL=deepseek-chat
 ```
 
-当前骨架内置了 mock fallback：V2 接口不可用时会使用本地演示运单并写入接口同步日志，页面会明确标注数据来源。
+本地不配置 `DATABASE_URL` 时使用 SQLite；生产环境配置 `DATABASE_URL` 后自动切换到独立 Neon/Postgres。V2 接口不可用时会优先使用 V3 本地快照/演示数据降级，并写入接口同步日志，页面会明确标注数据来源。
 
 ## 与 V2 联调
 
@@ -84,7 +88,7 @@ curl -X POST http://localhost:3000/api/jobs/reassign-disabled \
   -H "x-job-token: dev-v3-job-token"
 ```
 
-部署后可接 Vercel Cron，每 10 分钟触发一次。生产环境请设置 `V3_JOB_TOKEN`。
+部署后可接 Vercel Cron。当前 `vercel.json` 按 Vercel Hobby 限制配置为每天一次；如升级 Pro，可把 Cron 调整为更高频率。生产环境请设置 `V3_JOB_TOKEN`。
 
 ## 权限角色
 
@@ -111,4 +115,4 @@ curl -X POST http://localhost:3000/api/jobs/reassign-disabled \
 
 ## 数据库
 
-本地使用独立 SQLite 数据库 `data/v3.db`。该数据库只属于 V3，用于保存工单、扫描、审批、赔付、库存、规则和 V2 调用日志；V3 不直接连接 V2 数据库。
+本地使用独立 SQLite 数据库 `data/v3.db`。生产环境使用独立 Neon/Postgres，由 `DATABASE_URL` 控制。该数据库只属于 V3，用于保存工单、扫描、审批、赔付、库存、规则和 V2 调用日志；V3 不直接连接 V2 数据库。
