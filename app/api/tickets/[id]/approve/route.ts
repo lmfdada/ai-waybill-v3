@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { currentUser, flushWrites, hydrateStore, makeId } from "@/lib/store";
+import { currentUser, flushWrites, hydrateStore, makeId, runAtomic } from "@/lib/store";
 import { approveTicket } from "@/lib/workflow";
 
 export async function POST(request: NextRequest, context: RouteContext<"/api/tickets/[id]/approve">) {
@@ -7,7 +7,7 @@ export async function POST(request: NextRequest, context: RouteContext<"/api/tic
   const user = currentUser(request.headers);
   const { id } = await context.params;
   const body = await request.json();
-  const result = approveTicket({
+  const result = await runAtomic(() => approveTicket({
     ticketId: id,
     actorId: user.id,
     actorRole: user.role,
@@ -15,7 +15,7 @@ export async function POST(request: NextRequest, context: RouteContext<"/api/tic
     comment: String(body.comment || ""),
     expectedVersion: Number(body.expectedVersion || 0),
     operationKey: String(body.operationKey || makeId("op")),
-  });
+  }));
 
   await flushWrites();
   return NextResponse.json({ success: result.ok, message: result.message, data: result.ticket }, { status: result.ok ? 200 : 409 });

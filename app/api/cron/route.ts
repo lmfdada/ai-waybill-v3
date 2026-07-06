@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { flushWrites, hydrateStore } from "@/lib/store";
+import { flushWrites, hydrateStore, runAtomic } from "@/lib/store";
 import { processTimeouts, reassignDisabledApprovals } from "@/lib/workflow";
 
 export async function GET(request: NextRequest) {
@@ -13,8 +13,10 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({ success: false, message: "未授权的 Cron 调用" }, { status: 401 });
   }
 
-  const timeoutAffected = processTimeouts();
-  const reassigned = reassignDisabledApprovals("vercel-cron");
+  const { timeoutAffected, reassigned } = await runAtomic(() => ({
+    timeoutAffected: processTimeouts(),
+    reassigned: reassignDisabledApprovals("vercel-cron"),
+  }));
   await flushWrites();
 
   return NextResponse.json({

@@ -6,6 +6,7 @@ import {
   addTicket,
   db,
   findEnabledUserByRole,
+  getOpenQualityTicketForBatch,
   getOpenTicketForBatch,
   lockInventory,
   makeId,
@@ -61,6 +62,15 @@ export function createQualityTicket(params: {
 }) {
   const existing = getOpenTicketForBatch(params.snapshot.waybillNo, params.skuCode, params.batchNo);
   if (existing) return { ticket: existing, created: false };
+  const lockedByOtherWaybill = getOpenQualityTicketForBatch(params.skuCode, params.batchNo);
+  if (lockedByOtherWaybill) {
+    return {
+      ticket: lockedByOtherWaybill,
+      created: false,
+      blocked: true,
+      message: `批次 ${params.batchNo} 已被运单 ${lockedByOtherWaybill.waybillNo} 的未关闭品控工单锁定，禁止其他运单引用`,
+    };
+  }
 
   const status = chooseApprovalEntry(params.snapshot.amount, params.rule.approvalEntry);
   const assigneeRole = status === "level2_review" ? "level2_approver" : "level1_approver";
@@ -95,7 +105,7 @@ export function createQualityTicket(params: {
     qty: 1,
     reason: `品控暂扣：${params.rule.name}`,
   });
-  return { ticket, created: true };
+  return { ticket, created: true, blocked: false, message: "命中品控规则，已暂扣并创建工单" };
 }
 
 export function addScanRecord(record: Omit<ScanRecord, "id" | "createdAt">) {
@@ -263,6 +273,48 @@ export function approveTicket(params: {
     saveTicket(ticket);
   }
   return { ok: true, message: "审批完成", ticket };
+}
+
+export function resubmitTicket(params: {
+  ticketId: string;
+  actorId: string;
+  actorRole: UserRole;
+  comment: string;
+  expectedVersion: number;
+  operationKey: string;
+}) {
+  const ticket = db().tickets.find((item) => item.id === params.ticketId);
+  if (!ticket) return { ok: false, message: "工单不存在" };
+  if (db().approvals.some((item) => item.operationKey === params.operationKey)) return { ok: true, message: "重复重提已忽略", ticket };
+  if (ticket.version !== params.expectedVersion) return { ok: false, message: "该工单已被处理，请刷新" };
+  if (ticket.status !== "rejected") return { ok: false, message: "只有已拒绝工单可以重新提交" };
+  if (ticket.reporterId !== params.actorId && params.actorRole !== "admin") return { ok: false, message: "只有上报人或管理员可以重新提交" };
+  if (ticket.retryCount > 2) return { ok: false, message: "已超过重新提交次数上限" };
+
+  const toStatus = chooseApprovalEntry(ticket.amount);
+  const assigneeRole = toStatus === "level2_review" ? "level2_approver" : "level1_approver";
+  const fromStatus = ticket.status;
+  ticket.status = toStatus;
+  ticket.assigneeRole = assigneeRole;
+  ticket.assigneeId = findEnabledUserByRole(assigneeRole, ticket.reporterId)?.id;
+  ticket.version += 1;
+  ticket.updatedAt = now();
+  ticket.dueAt = new Date(Date.now() + (toStatus === "level2_review" ? 12 : 8) * 60 * 60 * 1000).toISOString();
+  saveTicket(ticket);
+  addApproval({
+    id: makeId("APV"),
+    ticketId: ticket.id,
+    level: "system",
+    actorId: params.actorId,
+    actorRole: params.actorRole,
+    result: "resubmitted",
+    comment: params.comment || "补充材料后重新提交",
+    fromStatus,
+    toStatus,
+    operationKey: params.operationKey,
+    createdAt: now(),
+  });
+  return { ok: true, message: "已重新提交审批", ticket };
 }
 
 export function fastRelease(ticketId: string, actorId: string, actorRole: UserRole, reason: string) {

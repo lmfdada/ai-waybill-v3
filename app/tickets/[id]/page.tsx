@@ -47,6 +47,7 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
   const { id } = use(params);
   const [detail, setDetail] = useState<Detail | null>(null);
   const [message, setMessage] = useState("");
+  const [fastReleasing, setFastReleasing] = useState(false);
 
   const load = useCallback(async () => {
     const res = await fetch(`/api/tickets/${id}`);
@@ -63,6 +64,8 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
   async function fastRelease() {
     const reason = window.prompt("请输入误判复核原因");
     if (!reason) return;
+    if (!window.confirm(`确认快速放行工单 ${id}？该操作会解锁批次并留下审计记录。`)) return;
+    setFastReleasing(true);
     const res = await fetch(`/api/tickets/${id}/fast-release`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-user-id": "qc-manager-a", "x-user-role": "qc_supervisor" },
@@ -70,6 +73,7 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
     });
     const json = await res.json();
     setMessage(json.message);
+    setFastReleasing(false);
     await load();
   }
 
@@ -93,7 +97,7 @@ export default function TicketDetailPage({ params }: { params: Promise<{ id: str
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             {ticket.category === "quality" && !["completed", "closed"].includes(ticket.status) && (
-              <button className="btn btn-primary" onClick={fastRelease}>误判快速放行</button>
+              <button className="btn btn-primary" disabled={fastReleasing} onClick={fastRelease}>{fastReleasing ? "放行中..." : "误判快速放行"}</button>
             )}
             <Link className="btn" href="/tickets">返回列表</Link>
           </div>

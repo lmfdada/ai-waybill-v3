@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { currentUser, flushWrites, getOpenTicketForBatch, hydrateStore } from "@/lib/store";
+import { currentUser, flushWrites, getOpenQualityTicketForBatch, getOpenTicketForBatch, hydrateStore, runAtomic } from "@/lib/store";
 import { validateSkuFromV2 } from "@/lib/v2-client";
 import { addScanRecord, createQualityTicket, findQcRule } from "@/lib/workflow";
 
@@ -32,10 +32,18 @@ export async function POST(request: NextRequest) {
 
   const sku = validation.data.sku;
   const existing = getOpenTicketForBatch(waybillNo, skuCode, sku.batchNo);
+  const lockedByOtherWaybill = getOpenQualityTicketForBatch(skuCode, sku.batchNo);
+  if (lockedByOtherWaybill && lockedByOtherWaybill.waybillNo !== waybillNo) {
+    return NextResponse.json({
+      success: false,
+      message: `批次 ${sku.batchNo} 已被运单 ${lockedByOtherWaybill.waybillNo} 的未关闭品控工单锁定，禁止其他运单引用`,
+      data: { ticket: lockedByOtherWaybill },
+    }, { status: 409 });
+  }
   const rule = findQcRule({ quantityDeltaPercent, damageLevel, specMatched, labelMatched, batchRisk });
 
   if (existing) {
-    const scan = addScanRecord({
+    const scan = await runAtomic(() => addScanRecord({
       ticketId: existing.id,
       waybillNo,
       skuCode,
@@ -46,13 +54,13 @@ export async function POST(request: NextRequest) {
       matchedRuleId: existing.id,
       decisionReason: "该批次已存在未关闭品控工单，重复扫描仅追加记录",
       description,
-    });
+    }));
     await flushWrites();
     return NextResponse.json({ success: true, message: "该批次已存在未关闭品控工单", data: { scan, ticket: existing, idempotent: true } });
   }
 
   if (!rule) {
-    const scan = addScanRecord({
+    const scan = await runAtomic(() => addScanRecord({
       waybillNo,
       skuCode,
       batchNo: sku.batchNo,
@@ -61,32 +69,39 @@ export async function POST(request: NextRequest) {
       status: "passed",
       decisionReason: "未命中品控异常规则，允许出库",
       description,
-    });
+    }));
     await flushWrites();
     return NextResponse.json({ success: true, message: "扫描通过", data: { scan, source: validation.source, warning: validation.warning } });
   }
 
-  const { ticket, created } = createQualityTicket({
-    snapshot: validation.data.waybill,
-    skuCode,
-    batchNo: sku.batchNo,
-    operatorId: user.id,
-    description: description || rule.name,
-    rule,
-  });
-  const scan = addScanRecord({
-    ticketId: ticket.id,
-    waybillNo,
-    skuCode,
-    batchNo: sku.batchNo,
-    operatorId: user.id,
-    deviceId: "manual-input",
-    status: "held",
-    matchedRuleId: rule.id,
-    decisionReason: `命中规则：${rule.name}`,
-    description,
+  const { ticket, created, blocked, message, scan } = await runAtomic(() => {
+    const quality = createQualityTicket({
+      snapshot: validation.data!.waybill!,
+      skuCode,
+      batchNo: sku.batchNo,
+      operatorId: user.id,
+      description: description || rule.name,
+      rule,
+    });
+    if (quality.blocked) return { ...quality, scan: null };
+    const record = addScanRecord({
+      ticketId: quality.ticket.id,
+      waybillNo,
+      skuCode,
+      batchNo: sku.batchNo,
+      operatorId: user.id,
+      deviceId: "manual-input",
+      status: "held",
+      matchedRuleId: rule.id,
+      decisionReason: `命中规则：${rule.name}`,
+      description,
+    });
+    return { ...quality, scan: record };
   });
 
   await flushWrites();
-  return NextResponse.json({ success: true, message: created ? "命中品控规则，已暂扣并创建工单" : "已追加扫描记录", data: { scan, ticket, rule } });
+  return NextResponse.json(
+    { success: !blocked, message: message || (created ? "命中品控规则，已暂扣并创建工单" : "已追加扫描记录"), data: { scan, ticket, rule } },
+    { status: blocked ? 409 : 200 }
+  );
 }

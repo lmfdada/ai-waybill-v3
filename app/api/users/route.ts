@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, flushWrites, hydrateStore, saveUser } from "@/lib/store";
+import { db, flushWrites, hydrateStore, runAtomic, saveUser } from "@/lib/store";
 import type { UserAccount, UserRole } from "@/lib/types";
 
 const roles: UserRole[] = ["operator", "qc_supervisor", "level1_approver", "level2_approver", "admin"];
@@ -26,7 +26,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ success: false, message: "用户 ID 和名称不能为空" }, { status: 400 });
   }
 
-  saveUser(user);
+  await runAtomic(() => saveUser(user));
   await flushWrites();
   return NextResponse.json({ success: true, data: user });
 }

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { flushWrites, hydrateStore } from "@/lib/store";
+import { flushWrites, hydrateStore, runAtomic } from "@/lib/store";
 import { reassignDisabledApprovals } from "@/lib/workflow";
 
 export async function POST(request: NextRequest) {
@@ -10,7 +10,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ success: false, message: "未授权的后台任务调用" }, { status: 401 });
   }
 
-  const affected = reassignDisabledApprovals();
+  const affected = await runAtomic(() => reassignDisabledApprovals());
   await flushWrites();
   return NextResponse.json({
     success: true,

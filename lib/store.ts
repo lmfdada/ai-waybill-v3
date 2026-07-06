@@ -51,6 +51,9 @@ const TABLES = {
 } as const;
 
 type TableName = (typeof TABLES)[keyof typeof TABLES];
+type PersistOp =
+  | { kind: "save"; table: string; id: string; value: unknown; createdAt: string }
+  | { kind: "delete"; table: string; id: string };
 
 let sqlite: Database.Database | null = null;
 function normalizePostgresUrl(value?: string) {
@@ -71,6 +74,7 @@ let pgReady: Promise<void> | null = null;
 let hydrated = false;
 let hydratePromise: Promise<void> | null = null;
 const pendingWrites: Promise<unknown>[] = [];
+let atomicOps: PersistOp[] | null = null;
 
 function tableSql(table: string): TableName {
   if ((Object.values(TABLES) as string[]).includes(table)) return table as TableName;
@@ -103,32 +107,50 @@ function loadTable<T>(table: string): T[] {
 }
 
 function saveRecord(table: string, id: string, value: unknown) {
+  const op: PersistOp = { kind: "save", table, id, value, createdAt: now() };
+  if (atomicOps) {
+    atomicOps.push(op);
+    return;
+  }
+  persistSave(op);
+}
+
+function persistSave(op: Extract<PersistOp, { kind: "save" }>) {
   if (usePostgres) {
     enqueuePgWrite(async () => {
       await ensurePostgres();
       await pg!.query(
-        `INSERT INTO ${tableSql(table)} (id, data, created_at)
+        `INSERT INTO ${tableSql(op.table)} (id, data, created_at)
          VALUES ($1, $2::jsonb, $3)
          ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at`,
-        [id, JSON.stringify(value), now()]
+        [op.id, JSON.stringify(op.value), op.createdAt]
       );
     });
     return;
   }
   getSqlite()
-    .prepare(`INSERT OR REPLACE INTO ${table} (id, data, created_at) VALUES (?, ?, ?)`)
-    .run(id, JSON.stringify(value), now());
+    .prepare(`INSERT OR REPLACE INTO ${op.table} (id, data, created_at) VALUES (?, ?, ?)`)
+    .run(op.id, JSON.stringify(op.value), op.createdAt);
 }
 
 function deleteRecord(table: string, id: string) {
+  const op: PersistOp = { kind: "delete", table, id };
+  if (atomicOps) {
+    atomicOps.push(op);
+    return;
+  }
+  persistDelete(op);
+}
+
+function persistDelete(op: Extract<PersistOp, { kind: "delete" }>) {
   if (usePostgres) {
     enqueuePgWrite(async () => {
       await ensurePostgres();
-      await pg!.query(`DELETE FROM ${tableSql(table)} WHERE id = $1`, [id]);
+      await pg!.query(`DELETE FROM ${tableSql(op.table)} WHERE id = $1`, [op.id]);
     });
     return;
   }
-  getSqlite().prepare(`DELETE FROM ${table} WHERE id = ?`).run(id);
+  getSqlite().prepare(`DELETE FROM ${op.table} WHERE id = ?`).run(op.id);
 }
 
 function tableCount(table: string) {
@@ -199,6 +221,80 @@ function enqueuePgWrite(write: () => Promise<unknown>) {
     throw error;
   });
   pendingWrites.push(promise);
+}
+
+async function persistAtomicOps(ops: PersistOp[]) {
+  if (ops.length === 0) return;
+  if (usePostgres) {
+    await ensurePostgres();
+    const sql = pg as unknown as {
+      query: (text: string, values: unknown[]) => unknown;
+      transaction: (queries: unknown[]) => Promise<unknown>;
+    };
+    await sql.transaction(
+      ops.map((op) => {
+        if (op.kind === "save") {
+          return sql.query(
+            `INSERT INTO ${tableSql(op.table)} (id, data, created_at)
+             VALUES ($1, $2::jsonb, $3)
+             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at`,
+            [op.id, JSON.stringify(op.value), op.createdAt]
+          );
+        }
+        return sql.query(`DELETE FROM ${tableSql(op.table)} WHERE id = $1`, [op.id]);
+      })
+    );
+    return;
+  }
+
+  const dbh = getSqlite();
+  const saveStmt = new Map<string, Database.Statement<[string, string, string]>>();
+  const deleteStmt = new Map<string, Database.Statement<[string]>>();
+  const tx = dbh.transaction((records: PersistOp[]) => {
+    for (const op of records) {
+      if (op.kind === "save") {
+        if (!saveStmt.has(op.table)) {
+          saveStmt.set(op.table, dbh.prepare(`INSERT OR REPLACE INTO ${op.table} (id, data, created_at) VALUES (?, ?, ?)`));
+        }
+        saveStmt.get(op.table)!.run(op.id, JSON.stringify(op.value), op.createdAt);
+      } else {
+        if (!deleteStmt.has(op.table)) {
+          deleteStmt.set(op.table, dbh.prepare(`DELETE FROM ${op.table} WHERE id = ?`));
+        }
+        deleteStmt.get(op.table)!.run(op.id);
+      }
+    }
+  });
+  tx(ops);
+}
+
+export async function runAtomic<T>(work: () => T | Promise<T>) {
+  if (atomicOps) throw new Error("Nested atomic workflow is not supported");
+  const snapshot: Store = structuredClone(store);
+  atomicOps = [];
+  try {
+    const result = await work();
+    const ops = atomicOps;
+    atomicOps = null;
+    await persistAtomicOps(ops);
+    return result;
+  } catch (error) {
+    atomicOps = null;
+    store.snapshots = snapshot.snapshots;
+    store.syncLogs = snapshot.syncLogs;
+    store.tickets = snapshot.tickets;
+    store.approvals = snapshot.approvals;
+    store.compensations = snapshot.compensations;
+    store.inventory = snapshot.inventory;
+    store.inventoryBatches = snapshot.inventoryBatches;
+    store.inventoryLocks = snapshot.inventoryLocks;
+    store.scans = snapshot.scans;
+    store.qcRules = snapshot.qcRules;
+    store.approvalRules = snapshot.approvalRules;
+    store.users = snapshot.users;
+    console.error("Atomic workflow failed; state rolled back for compensation", error);
+    throw error;
+  }
 }
 
 export async function flushWrites() {
@@ -445,6 +541,16 @@ export function getOpenTicketForBatch(waybillNo: string, skuCode: string, batchN
     (ticket) =>
       ticket.category === "quality" &&
       ticket.waybillNo === waybillNo &&
+      ticket.skuCode === skuCode &&
+      ticket.batchNo === batchNo &&
+      !["completed", "closed"].includes(ticket.status)
+  );
+}
+
+export function getOpenQualityTicketForBatch(skuCode: string, batchNo: string) {
+  return store.tickets.find(
+    (ticket) =>
+      ticket.category === "quality" &&
       ticket.skuCode === skuCode &&
       ticket.batchNo === batchNo &&
       !["completed", "closed"].includes(ticket.status)

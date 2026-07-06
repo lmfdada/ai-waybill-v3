@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { currentUser, db, flushWrites, hydrateStore } from "@/lib/store";
+import { currentUser, db, flushWrites, hydrateStore, runAtomic } from "@/lib/store";
 import { getWaybillFromV2 } from "@/lib/v2-client";
 import { createManualTicket } from "@/lib/workflow";
 import type { ExceptionTicket } from "@/lib/types";
@@ -45,13 +45,14 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ success: false, message: "无权对其他仓库/商户的运单发起异常" }, { status: 403 });
   }
 
-  const created = createManualTicket({
-    snapshot: result.data,
+  const snapshot = result.data;
+  const created = await runAtomic(() => createManualTicket({
+    snapshot,
     type,
-    amount: amount || result.data.amount,
+    amount: amount || snapshot.amount,
     description,
     reporterId: user.id,
-  });
+  }));
 
   await flushWrites();
   return NextResponse.json({
