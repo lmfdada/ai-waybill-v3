@@ -1,0 +1,212 @@
+:root {
+  --primary: #0fc6c2;
+  --primary-dark: #0da8a4;
+  --nav-bg: #00263c;
+  --header-bg: linear-gradient(90deg, #0fc6c2 0%, #004d72 100%);
+  --page-bg: #f3f9fe;
+  --card-bg: #ffffff;
+  --border: #dcdfe6;
+  --border-light: #ebeef5;
+  --text: #303133;
+  --muted: #909399;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --success: #17c964;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--page-bg);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+}
+
+a { color: inherit; text-decoration: none; }
+
+.shell {
+  display: flex;
+  min-height: 100vh;
+}
+
+.sidebar {
+  width: 224px;
+  background: var(--nav-bg);
+  color: rgba(255, 255, 255, 0.78);
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  height: 64px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.brand-mark {
+  width: 36px;
+  height: 36px;
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  background: linear-gradient(135deg, var(--primary), var(--primary-dark));
+  color: #fff;
+  font-weight: 700;
+}
+
+.brand-title { color: #fff; font-size: 16px; font-weight: 650; }
+.brand-sub { font-size: 11px; color: rgba(255,255,255,.48); }
+
+.nav {
+  padding: 10px 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.nav a {
+  padding: 11px 20px;
+  font-size: 14px;
+}
+
+.nav a:hover, .nav a.active {
+  color: #fff;
+  background: var(--primary);
+}
+
+.main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  height: 56px;
+  flex-shrink: 0;
+  background: var(--header-bg);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+}
+
+.content {
+  padding: 16px;
+  flex: 1;
+  overflow: auto;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  gap: 16px;
+}
+
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--border-light);
+  border-radius: 6px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.04);
+}
+
+.card-header {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-light);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.card-title { font-size: 15px; font-weight: 650; }
+.card-body { padding: 16px; }
+
+.stat {
+  padding: 16px;
+}
+
+.stat-label { color: var(--muted); font-size: 12px; }
+.stat-value { font-size: 24px; font-weight: 700; margin-top: 6px; }
+
+.btn {
+  border: 1px solid var(--border);
+  background: #fff;
+  border-radius: 4px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.btn-primary {
+  border-color: var(--primary);
+  background: var(--primary);
+  color: #fff;
+}
+
+.btn-danger {
+  border-color: rgba(239, 68, 68, .35);
+  background: rgba(239, 68, 68, .08);
+  color: var(--danger);
+}
+
+.input, .select, .textarea {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  font-size: 13px;
+  background: #fff;
+}
+
+.textarea { min-height: 76px; resize: vertical; }
+
+.form-row {
+  display: grid;
+  grid-template-columns: 140px 1fr;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.table th, .table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-light);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.table th { background: #fafafa; font-weight: 650; }
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 99px;
+  padding: 2px 8px;
+  font-size: 12px;
+  background: rgba(15, 198, 194, .1);
+  color: var(--primary-dark);
+}
+
+.tag-warning { background: rgba(245, 158, 11, .12); color: #b45309; }
+.tag-danger { background: rgba(239, 68, 68, .1); color: #dc2626; }
+.tag-muted { background: #f3f4f6; color: #6b7280; }
+
+@media (max-width: 900px) {
+  .shell { flex-direction: column; }
+  .sidebar { width: 100%; }
+  .nav { flex-direction: row; overflow-x: auto; }
+  .grid { grid-template-columns: 1fr; }
+  .form-row { grid-template-columns: 1fr; }
+}
+

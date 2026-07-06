@@ -1,0 +1,618 @@
+import type {
+  ApprovalRecord,
+  ApprovalRule,
+  CompensationRecord,
+  InventoryBatch,
+  InventoryLock,
+  ExceptionTicket,
+  InventoryRecord,
+  QcRule,
+  ScanRecord,
+  SyncLog,
+  UserAccount,
+  UserRole,
+  WaybillSnapshot,
+} from "./types";
+import { neon } from "@neondatabase/serverless";
+import Database from "better-sqlite3";
+import fs from "fs";
+import path from "path";
+
+type Store = {
+  snapshots: WaybillSnapshot[];
+  syncLogs: SyncLog[];
+  tickets: ExceptionTicket[];
+  approvals: ApprovalRecord[];
+  compensations: CompensationRecord[];
+  inventory: InventoryRecord[];
+  inventoryBatches: InventoryBatch[];
+  inventoryLocks: InventoryLock[];
+  scans: ScanRecord[];
+  qcRules: QcRule[];
+  approvalRules: ApprovalRule[];
+  users: UserAccount[];
+};
+
+const now = () => new Date().toISOString();
+
+const TABLES = {
+  snapshots: "waybill_snapshots",
+  syncLogs: "sync_logs",
+  tickets: "exception_tickets",
+  approvals: "approval_records",
+  compensations: "compensation_records",
+  inventory: "inventory_records",
+  inventoryBatches: "inventory_batches",
+  inventoryLocks: "inventory_locks",
+  scans: "scan_records",
+  qcRules: "qc_rules",
+  approvalRules: "approval_rules",
+  users: "user_accounts",
+} as const;
+
+type TableName = (typeof TABLES)[keyof typeof TABLES];
+
+let sqlite: Database.Database | null = null;
+function normalizePostgresUrl(value?: string) {
+  if (!value) return "";
+  try {
+    const url = new URL(value);
+    url.searchParams.delete("channel_binding");
+    return url.toString();
+  } catch {
+    return value.replace(/([?&])channel_binding=[^&]+&?/, "$1").replace(/[?&]$/, "");
+  }
+}
+
+const postgresUrl = normalizePostgresUrl(process.env.DATABASE_URL);
+const usePostgres = Boolean(postgresUrl);
+const pg = postgresUrl ? neon(postgresUrl) : null;
+let pgReady: Promise<void> | null = null;
+let hydrated = false;
+let hydratePromise: Promise<void> | null = null;
+const pendingWrites: Promise<unknown>[] = [];
+
+function tableSql(table: string): TableName {
+  if ((Object.values(TABLES) as string[]).includes(table)) return table as TableName;
+  throw new Error(`Unknown table: ${table}`);
+}
+
+function getSqlite() {
+  if (sqlite) return sqlite;
+  const dbDir = path.join(process.cwd(), "data");
+  fs.mkdirSync(dbDir, { recursive: true });
+  sqlite = new Database(path.join(dbDir, "v3.db"));
+  sqlite.pragma("journal_mode = WAL");
+  for (const table of Object.values(TABLES)) {
+    sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS ${table} (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      )
+    `);
+  }
+  return sqlite;
+}
+
+function loadTable<T>(table: string): T[] {
+  if (usePostgres) return [];
+  const dbh = getSqlite();
+  const rows = dbh.prepare(`SELECT data FROM ${table} ORDER BY created_at DESC`).all() as { data: string }[];
+  return rows.map((row) => JSON.parse(row.data) as T);
+}
+
+function saveRecord(table: string, id: string, value: unknown) {
+  if (usePostgres) {
+    enqueuePgWrite(async () => {
+      await ensurePostgres();
+      await pg!.query(
+        `INSERT INTO ${tableSql(table)} (id, data, created_at)
+         VALUES ($1, $2::jsonb, $3)
+         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at`,
+        [id, JSON.stringify(value), now()]
+      );
+    });
+    return;
+  }
+  getSqlite()
+    .prepare(`INSERT OR REPLACE INTO ${table} (id, data, created_at) VALUES (?, ?, ?)`)
+    .run(id, JSON.stringify(value), now());
+}
+
+function deleteRecord(table: string, id: string) {
+  if (usePostgres) {
+    enqueuePgWrite(async () => {
+      await ensurePostgres();
+      await pg!.query(`DELETE FROM ${tableSql(table)} WHERE id = $1`, [id]);
+    });
+    return;
+  }
+  getSqlite().prepare(`DELETE FROM ${table} WHERE id = ?`).run(id);
+}
+
+function tableCount(table: string) {
+  if (usePostgres) return 0;
+  const row = getSqlite().prepare(`SELECT COUNT(*) AS total FROM ${table}`).get() as { total: number };
+  return Number(row.total || 0);
+}
+
+function seedRecords<T extends { id?: string; waybillNo?: string }>(
+  table: string,
+  items: T[],
+  idOf: (item: T) => string
+) {
+  if (usePostgres) return;
+  const dbh = getSqlite();
+  const stmt = dbh.prepare(`INSERT OR IGNORE INTO ${table} (id, data, created_at) VALUES (?, ?, ?)`);
+  const tx = dbh.transaction((records: T[]) => {
+    for (const item of records) stmt.run(idOf(item), JSON.stringify(item), now());
+  });
+  tx(items);
+}
+
+async function ensurePostgres() {
+  if (!pg) return;
+  if (!pgReady) {
+    pgReady = (async () => {
+      for (const table of Object.values(TABLES)) {
+        await pg.query(
+          `CREATE TABLE IF NOT EXISTS ${tableSql(table)} (
+            id TEXT PRIMARY KEY,
+            data JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+          )`
+        );
+      }
+    })();
+  }
+  await pgReady;
+}
+
+async function pgCount(table: string) {
+  if (!pg) return 0;
+  const rows = await pg.query(`SELECT COUNT(*)::int AS total FROM ${tableSql(table)}`);
+  return Number(rows[0]?.total || 0);
+}
+
+async function pgSeedRecords<T>(table: string, items: T[], idOf: (item: T) => string) {
+  if (!pg) return;
+  for (const item of items) {
+    await pg.query(
+      `INSERT INTO ${tableSql(table)} (id, data, created_at)
+       VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (id) DO NOTHING`,
+      [idOf(item), JSON.stringify(item), now()]
+    );
+  }
+}
+
+async function pgLoadTable<T>(table: string): Promise<T[]> {
+  if (!pg) return [];
+  const rows = await pg.query(`SELECT data FROM ${tableSql(table)} ORDER BY created_at DESC`);
+  return rows.map((row) => row.data as T);
+}
+
+function enqueuePgWrite(write: () => Promise<unknown>) {
+  const promise = write().catch((error) => {
+    console.error("Postgres write failed", error);
+    throw error;
+  });
+  pendingWrites.push(promise);
+}
+
+export async function flushWrites() {
+  if (!usePostgres) return;
+  while (pendingWrites.length > 0) {
+    const writes = pendingWrites.splice(0);
+    await Promise.all(writes);
+  }
+}
+
+const demoSnapshots: WaybillSnapshot[] = [
+  {
+    waybillNo: "JT202607060001",
+    externalCode: "PS2512220005001",
+    receiverStore: "海口龙湖天街店",
+    receiverName: "林小满",
+    receiverPhone: "13800138001",
+    receiverAddress: "海南省海口市龙华区龙湖天街",
+    amount: 1280,
+    warehouseId: "WH-HN",
+    merchantId: "M-ZTOCC",
+    source: "mock",
+    syncedAt: now(),
+    skus: [
+      { skuCode: "SKU-DRY-001", skuName: "常温烙锅底料", expectedQty: 20, batchNo: "BATCH-HK-001", temperatureLayer: "常温" },
+      { skuCode: "SKU-COLD-008", skuName: "冷藏牛肉卷", expectedQty: 8, batchNo: "BATCH-HK-002", temperatureLayer: "冷藏" },
+    ],
+  },
+  {
+    waybillNo: "JT202607060002",
+    externalCode: "PS2512220005002",
+    receiverStore: "长沙五一广场店",
+    receiverName: "周星",
+    receiverPhone: "13800138002",
+    receiverAddress: "湖南省长沙市芙蓉区五一广场",
+    amount: 5600,
+    warehouseId: "WH-HN",
+    merchantId: "M-ZTOCC",
+    source: "mock",
+    syncedAt: now(),
+    skus: [
+      { skuCode: "SKU-FROZEN-021", skuName: "冷冻羊肉片", expectedQty: 50, batchNo: "BATCH-CS-021", temperatureLayer: "冷冻" },
+      { skuCode: "SKU-DRY-003", skuName: "干碟调料", expectedQty: 60, batchNo: "BATCH-CS-003", temperatureLayer: "常温" },
+    ],
+  },
+];
+
+const seedTickets: ExceptionTicket[] = [
+  {
+    id: "T-20260706-0001",
+    source: "manual",
+    category: "logistics",
+    type: "lost",
+    status: "level1_review",
+    waybillNo: "JT202607060001",
+    amount: 1280,
+    description: "承运商反馈中转扫描后无下文，疑似丢件。",
+    reporterId: "operator-a",
+    assigneeRole: "level1_approver",
+    retryCount: 0,
+    version: 1,
+    createdAt: now(),
+    updatedAt: now(),
+    dueAt: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+    snapshotSource: "mock",
+    snapshotSyncedAt: now(),
+  },
+];
+
+const seedQcRules: QcRule[] = [
+    {
+      id: "QC-QTY-10",
+      name: "数量差异超过 10%",
+      subtype: "quantity_mismatch",
+      severity: "high",
+      conditionType: "quantity_delta_percent",
+      threshold: 10,
+      autoCreateTicket: true,
+      approvalEntry: "level2",
+      enabled: true,
+    },
+    {
+      id: "QC-DAMAGE-3",
+      name: "外观破损等级 >= 3",
+      subtype: "appearance_damage",
+      severity: "medium",
+      conditionType: "damage_level",
+      threshold: 3,
+      autoCreateTicket: true,
+      approvalEntry: "level1",
+      enabled: true,
+    },
+  ];
+
+const seedApprovalRules: ApprovalRule[] = [
+    {
+      id: "APV-L1",
+      name: "3000 元以下一级审批",
+      minAmount: 0,
+      targetLevel: "level1",
+      timeoutHours: 8,
+      maxResubmitCount: 2,
+      enabled: true,
+    },
+    {
+      id: "APV-L2",
+      name: "3000 元及以上二级审批",
+      minAmount: 3000,
+      targetLevel: "level2",
+      timeoutHours: 12,
+      maxResubmitCount: 2,
+      enabled: true,
+    },
+  ];
+
+const seedUsers: UserAccount[] = [
+  { id: "operator-a", name: "操作员 A", role: "operator", enabled: true, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+  { id: "operator-b", name: "操作员 B", role: "operator", enabled: true, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+  { id: "qc-manager-a", name: "品控主管 A", role: "qc_supervisor", enabled: true, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+  { id: "approver-a", name: "一级审批 A", role: "level1_approver", enabled: true, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+  { id: "approver-b", name: "二级审批 B", role: "level2_approver", enabled: true, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+  { id: "approver-disabled", name: "禁用审批人", role: "level1_approver", enabled: false, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+  { id: "admin-a", name: "管理员 A", role: "admin", enabled: true, warehouseId: "WH-HN", merchantId: "M-ZTOCC" },
+];
+
+const seedInventoryBatches: InventoryBatch[] = [
+  { id: "IB-SKU-DRY-001-BATCH-HK-001", skuCode: "SKU-DRY-001", batchNo: "BATCH-HK-001", totalQty: 100, availableQty: 100, lockedQty: 0, status: "available", updatedAt: now() },
+  { id: "IB-SKU-COLD-008-BATCH-HK-002", skuCode: "SKU-COLD-008", batchNo: "BATCH-HK-002", totalQty: 40, availableQty: 40, lockedQty: 0, status: "available", updatedAt: now() },
+  { id: "IB-SKU008-perf_test_1780671746173", skuCode: "SKU008", batchNo: "perf_test_1780671746173", totalQty: 20, availableQty: 20, lockedQty: 0, status: "available", updatedAt: now() },
+];
+
+function ensureSeeded() {
+  if (usePostgres) return;
+  getSqlite();
+  if (tableCount(TABLES.snapshots) === 0) seedRecords(TABLES.snapshots, demoSnapshots, (item) => item.waybillNo);
+  if (tableCount(TABLES.tickets) === 0) seedRecords(TABLES.tickets, seedTickets, (item) => item.id);
+  if (tableCount(TABLES.qcRules) === 0) seedRecords(TABLES.qcRules, seedQcRules, (item) => item.id);
+  if (tableCount(TABLES.approvalRules) === 0) seedRecords(TABLES.approvalRules, seedApprovalRules, (item) => item.id);
+  if (tableCount(TABLES.users) === 0) seedRecords(TABLES.users, seedUsers, (item) => item.id);
+  if (tableCount(TABLES.inventoryBatches) === 0) seedRecords(TABLES.inventoryBatches, seedInventoryBatches, (item) => item.id);
+}
+
+ensureSeeded();
+
+const store: Store = {
+  snapshots: usePostgres ? [...demoSnapshots] : loadTable<WaybillSnapshot>(TABLES.snapshots),
+  syncLogs: usePostgres ? [] : loadTable<SyncLog>(TABLES.syncLogs),
+  tickets: usePostgres ? [...seedTickets] : loadTable<ExceptionTicket>(TABLES.tickets),
+  approvals: usePostgres ? [] : loadTable<ApprovalRecord>(TABLES.approvals),
+  compensations: usePostgres ? [] : loadTable<CompensationRecord>(TABLES.compensations),
+  inventory: usePostgres ? [] : loadTable<InventoryRecord>(TABLES.inventory),
+  inventoryBatches: usePostgres ? [...seedInventoryBatches] : loadTable<InventoryBatch>(TABLES.inventoryBatches),
+  inventoryLocks: usePostgres ? [] : loadTable<InventoryLock>(TABLES.inventoryLocks),
+  scans: usePostgres ? [] : loadTable<ScanRecord>(TABLES.scans),
+  qcRules: usePostgres ? [...seedQcRules] : loadTable<QcRule>(TABLES.qcRules),
+  approvalRules: usePostgres ? [...seedApprovalRules] : loadTable<ApprovalRule>(TABLES.approvalRules),
+  users: usePostgres ? [...seedUsers] : loadTable<UserAccount>(TABLES.users),
+};
+
+async function seedPostgresIfNeeded() {
+  await ensurePostgres();
+  if ((await pgCount(TABLES.snapshots)) === 0) await pgSeedRecords(TABLES.snapshots, demoSnapshots, (item) => item.waybillNo);
+  if ((await pgCount(TABLES.tickets)) === 0) await pgSeedRecords(TABLES.tickets, seedTickets, (item) => item.id);
+  if ((await pgCount(TABLES.qcRules)) === 0) await pgSeedRecords(TABLES.qcRules, seedQcRules, (item) => item.id);
+  if ((await pgCount(TABLES.approvalRules)) === 0) await pgSeedRecords(TABLES.approvalRules, seedApprovalRules, (item) => item.id);
+  if ((await pgCount(TABLES.users)) === 0) await pgSeedRecords(TABLES.users, seedUsers, (item) => item.id);
+  if ((await pgCount(TABLES.inventoryBatches)) === 0) await pgSeedRecords(TABLES.inventoryBatches, seedInventoryBatches, (item) => item.id);
+}
+
+async function loadPostgresStore() {
+  await seedPostgresIfNeeded();
+  store.snapshots = await pgLoadTable<WaybillSnapshot>(TABLES.snapshots);
+  store.syncLogs = await pgLoadTable<SyncLog>(TABLES.syncLogs);
+  store.tickets = await pgLoadTable<ExceptionTicket>(TABLES.tickets);
+  store.approvals = await pgLoadTable<ApprovalRecord>(TABLES.approvals);
+  store.compensations = await pgLoadTable<CompensationRecord>(TABLES.compensations);
+  store.inventory = await pgLoadTable<InventoryRecord>(TABLES.inventory);
+  store.inventoryBatches = await pgLoadTable<InventoryBatch>(TABLES.inventoryBatches);
+  store.inventoryLocks = await pgLoadTable<InventoryLock>(TABLES.inventoryLocks);
+  store.scans = await pgLoadTable<ScanRecord>(TABLES.scans);
+  store.qcRules = await pgLoadTable<QcRule>(TABLES.qcRules);
+  store.approvalRules = await pgLoadTable<ApprovalRule>(TABLES.approvalRules);
+  store.users = await pgLoadTable<UserAccount>(TABLES.users);
+  hydrated = true;
+}
+
+export async function hydrateStore() {
+  if (!usePostgres || hydrated) return;
+  hydratePromise ??= loadPostgresStore().finally(() => {
+    hydratePromise = null;
+  });
+  await hydratePromise;
+}
+
+export async function refreshStore() {
+  if (!usePostgres) return;
+  await loadPostgresStore();
+}
+
+export function db() {
+  return store;
+}
+
+export function makeId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+export function roleFromHeader(role: string | null): UserRole {
+  if (
+    role === "operator" ||
+    role === "qc_supervisor" ||
+    role === "level1_approver" ||
+    role === "level2_approver" ||
+    role === "admin"
+  ) {
+    return role;
+  }
+  return "operator";
+}
+
+export function currentUser(headers: Headers) {
+  const id = headers.get("x-user-id") || "operator-a";
+  const user = store.users.find((item) => item.id === id);
+  if (user) {
+    return {
+      id: user.id,
+      role: user.role,
+      warehouseId: user.warehouseId,
+      merchantId: user.merchantId,
+      enabled: user.enabled,
+    };
+  }
+  return {
+    id,
+    role: roleFromHeader(headers.get("x-user-role")),
+    warehouseId: headers.get("x-warehouse-id") || "WH-HN",
+    merchantId: headers.get("x-merchant-id") || "M-ZTOCC",
+    enabled: true,
+  };
+}
+
+export function getOpenTicketForBatch(waybillNo: string, skuCode: string, batchNo: string) {
+  return store.tickets.find(
+    (ticket) =>
+      ticket.category === "quality" &&
+      ticket.waybillNo === waybillNo &&
+      ticket.skuCode === skuCode &&
+      ticket.batchNo === batchNo &&
+      !["completed", "closed"].includes(ticket.status)
+  );
+}
+
+export function getSnapshot(waybillNo: string) {
+  return store.snapshots.find((item) => item.waybillNo === waybillNo);
+}
+
+export function addSyncLog(log: Omit<SyncLog, "id" | "createdAt">) {
+  const entry = { id: makeId("LOG"), createdAt: now(), ...log };
+  store.syncLogs.unshift(entry);
+  saveRecord(TABLES.syncLogs, entry.id, entry);
+  const removed = store.syncLogs.splice(200);
+  for (const item of removed) deleteRecord(TABLES.syncLogs, item.id);
+  return entry;
+}
+
+export function addTicket(ticket: ExceptionTicket) {
+  store.tickets.unshift(ticket);
+  saveRecord(TABLES.tickets, ticket.id, ticket);
+}
+
+export function saveTicket(ticket: ExceptionTicket) {
+  saveRecord(TABLES.tickets, ticket.id, ticket);
+}
+
+export function addApproval(record: ApprovalRecord) {
+  store.approvals.unshift(record);
+  saveRecord(TABLES.approvals, record.id, record);
+}
+
+export function addCompensation(record: CompensationRecord) {
+  store.compensations.unshift(record);
+  saveRecord(TABLES.compensations, record.id, record);
+}
+
+export function addInventoryRecord(record: InventoryRecord) {
+  store.inventory.unshift(record);
+  saveRecord(TABLES.inventory, record.id, record);
+}
+
+export function saveInventoryBatch(batch: InventoryBatch) {
+  const idx = store.inventoryBatches.findIndex((item) => item.id === batch.id);
+  if (idx >= 0) store.inventoryBatches[idx] = batch;
+  else store.inventoryBatches.unshift(batch);
+  saveRecord(TABLES.inventoryBatches, batch.id, batch);
+}
+
+export function saveInventoryLock(lock: InventoryLock) {
+  const idx = store.inventoryLocks.findIndex((item) => item.id === lock.id);
+  if (idx >= 0) store.inventoryLocks[idx] = lock;
+  else store.inventoryLocks.unshift(lock);
+  saveRecord(TABLES.inventoryLocks, lock.id, lock);
+}
+
+export function ensureInventoryBatch(skuCode: string, batchNo: string) {
+  const id = `IB-${skuCode}-${batchNo}`;
+  let batch = store.inventoryBatches.find((item) => item.skuCode === skuCode && item.batchNo === batchNo);
+  if (!batch) {
+    batch = { id, skuCode, batchNo, totalQty: 0, availableQty: 0, lockedQty: 0, status: "available", updatedAt: now() };
+    saveInventoryBatch(batch);
+  }
+  return batch;
+}
+
+export function lockInventory(params: { ticketId: string; skuCode: string; batchNo: string; qty: number; reason: string }) {
+  const batch = ensureInventoryBatch(params.skuCode, params.batchNo);
+  const qty = Math.max(1, params.qty);
+  batch.availableQty = Math.max(0, batch.availableQty - qty);
+  batch.lockedQty += qty;
+  batch.status = batch.lockedQty > 0 ? "locked" : "available";
+  batch.updatedAt = now();
+  saveInventoryBatch(batch);
+
+  const existing = store.inventoryLocks.find((item) => item.ticketId === params.ticketId && item.skuCode === params.skuCode && item.batchNo === params.batchNo && item.status === "locked");
+  if (existing) return existing;
+
+  const lock: InventoryLock = {
+    id: makeId("LOCK"),
+    ticketId: params.ticketId,
+    skuCode: params.skuCode,
+    batchNo: params.batchNo,
+    qty,
+    status: "locked",
+    reason: params.reason,
+    createdAt: now(),
+    updatedAt: now(),
+  };
+  saveInventoryLock(lock);
+  return lock;
+}
+
+export function releaseInventoryLock(ticketId: string, mode: "release" | "consume" = "release") {
+  const locks = store.inventoryLocks.filter((item) => item.ticketId === ticketId && item.status === "locked");
+  for (const lock of locks) {
+    const batch = ensureInventoryBatch(lock.skuCode, lock.batchNo);
+    batch.lockedQty = Math.max(0, batch.lockedQty - lock.qty);
+    if (mode === "release") batch.availableQty += lock.qty;
+    batch.status = batch.lockedQty > 0 ? "locked" : "available";
+    batch.updatedAt = now();
+    saveInventoryBatch(batch);
+
+    lock.status = mode === "release" ? "released" : "consumed";
+    lock.updatedAt = now();
+    saveInventoryLock(lock);
+  }
+  return locks;
+}
+
+export function addScan(scan: ScanRecord) {
+  store.scans.unshift(scan);
+  saveRecord(TABLES.scans, scan.id, scan);
+}
+
+export function saveQcRule(rule: QcRule) {
+  const idx = store.qcRules.findIndex((item) => item.id === rule.id);
+  if (idx >= 0) store.qcRules[idx] = rule;
+  else store.qcRules.unshift(rule);
+  saveRecord(TABLES.qcRules, rule.id, rule);
+}
+
+export function saveApprovalRule(rule: ApprovalRule) {
+  const idx = store.approvalRules.findIndex((item) => item.id === rule.id);
+  if (idx >= 0) store.approvalRules[idx] = rule;
+  else store.approvalRules.unshift(rule);
+  saveRecord(TABLES.approvalRules, rule.id, rule);
+}
+
+export function saveUser(user: UserAccount) {
+  const idx = store.users.findIndex((item) => item.id === user.id);
+  if (idx >= 0) store.users[idx] = user;
+  else store.users.unshift(user);
+  saveRecord(TABLES.users, user.id, user);
+}
+
+export function findEnabledUserByRole(role: UserRole, excludeUserId?: string) {
+  return store.users.find((user) => user.role === role && user.enabled && user.id !== excludeUserId);
+}
+
+export function seedManyTickets(count = 220) {
+  const statuses: ExceptionTicket["status"][] = ["pending", "level1_review", "level2_review", "executing", "completed", "rejected"];
+  const types: ExceptionTicket["type"][] = ["lost", "damaged", "rejected", "timeout", "address_error"];
+  for (let i = 0; i < count; i++) {
+    const snapshot = store.snapshots[i % store.snapshots.length];
+    const ticket: ExceptionTicket = {
+      id: `T-SEED-${String(i + 1).padStart(4, "0")}`,
+      source: "manual",
+      category: "logistics",
+      type: types[i % types.length],
+      status: statuses[i % statuses.length],
+      waybillNo: snapshot.waybillNo,
+      amount: snapshot.amount + (i % 7) * 120,
+      description: `模拟异常工单 ${i + 1}`,
+      reporterId: i % 4 === 0 ? "operator-b" : "operator-a",
+      assigneeRole: i % 3 === 0 ? "level2_approver" : "level1_approver",
+      retryCount: i % 2,
+      version: 1,
+      createdAt: now(),
+      updatedAt: now(),
+      dueAt: new Date(Date.now() + ((i % 10) - 2) * 60 * 60 * 1000).toISOString(),
+      snapshotSource: snapshot.source,
+      snapshotSyncedAt: snapshot.syncedAt,
+    };
+    if (!store.tickets.some((item) => item.id === ticket.id)) {
+      store.tickets.push(ticket);
+      saveRecord(TABLES.tickets, ticket.id, ticket);
+    }
+  }
+}
