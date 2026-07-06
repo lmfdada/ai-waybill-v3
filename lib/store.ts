@@ -51,6 +51,31 @@ const TABLES = {
 } as const;
 
 type TableName = (typeof TABLES)[keyof typeof TABLES];
+const PROJECTION_COLUMNS = [
+  "waybill_no",
+  "ticket_id",
+  "approval_id",
+  "operation_key",
+  "sku_code",
+  "batch_no",
+  "category",
+  "source",
+  "type",
+  "status",
+  "assignee_id",
+  "assignee_role",
+  "reporter_id",
+  "actor_id",
+  "actor_role",
+  "direction",
+  "amount",
+  "version",
+  "due_at",
+  "updated_at",
+] as const;
+type ProjectionColumn = (typeof PROJECTION_COLUMNS)[number];
+type ProjectionValue = string | number | null;
+type Projection = Record<ProjectionColumn, ProjectionValue>;
 type PersistOp =
   | { kind: "save"; table: string; id: string; value: unknown; createdAt: string }
   | { kind: "delete"; table: string; id: string };
@@ -96,7 +121,127 @@ function getSqlite() {
       )
     `);
   }
+  ensureSqliteProjectionSchema(sqlite);
   return sqlite;
+}
+
+function emptyProjection(): Projection {
+  return Object.fromEntries(PROJECTION_COLUMNS.map((column) => [column, null])) as Projection;
+}
+
+function projectRecord(table: string, value: unknown): Projection {
+  const projection = emptyProjection();
+  const record = value as Record<string, unknown>;
+  if (table === TABLES.snapshots) {
+    projection.waybill_no = String(record.waybillNo || "");
+    projection.source = String(record.source || "");
+    projection.amount = Number(record.amount || 0);
+    projection.updated_at = String(record.syncedAt || "");
+  } else if (table === TABLES.tickets) {
+    projection.waybill_no = String(record.waybillNo || "");
+    projection.ticket_id = String(record.id || "");
+    projection.sku_code = record.skuCode ? String(record.skuCode) : null;
+    projection.batch_no = record.batchNo ? String(record.batchNo) : null;
+    projection.category = String(record.category || "");
+    projection.source = String(record.source || "");
+    projection.type = String(record.type || "");
+    projection.status = String(record.status || "");
+    projection.assignee_id = record.assigneeId ? String(record.assigneeId) : null;
+    projection.assignee_role = String(record.assigneeRole || "");
+    projection.reporter_id = String(record.reporterId || "");
+    projection.amount = Number(record.amount || 0);
+    projection.version = Number(record.version || 0);
+    projection.due_at = String(record.dueAt || "");
+    projection.updated_at = String(record.updatedAt || "");
+  } else if (table === TABLES.approvals) {
+    projection.ticket_id = String(record.ticketId || "");
+    projection.operation_key = String(record.operationKey || "");
+    projection.status = String(record.toStatus || "");
+    projection.actor_id = String(record.actorId || "");
+    projection.actor_role = String(record.actorRole || "");
+    projection.updated_at = String(record.createdAt || "");
+  } else if (table === TABLES.compensations) {
+    projection.ticket_id = String(record.ticketId || "");
+    projection.approval_id = String(record.approvalId || "");
+    projection.direction = String(record.direction || "");
+    projection.amount = Number(record.amount || 0);
+    projection.status = String(record.status || "");
+    projection.updated_at = String(record.createdAt || "");
+  } else if (table === TABLES.inventory) {
+    projection.ticket_id = String(record.ticketId || "");
+    projection.approval_id = String(record.approvalId || "");
+    projection.sku_code = String(record.skuCode || "");
+    projection.batch_no = String(record.batchNo || "");
+    projection.type = String(record.changeType || "");
+    projection.updated_at = String(record.createdAt || "");
+  } else if (table === TABLES.inventoryBatches) {
+    projection.sku_code = String(record.skuCode || "");
+    projection.batch_no = String(record.batchNo || "");
+    projection.status = String(record.status || "");
+    projection.amount = Number(record.lockedQty || 0);
+    projection.updated_at = String(record.updatedAt || "");
+  } else if (table === TABLES.inventoryLocks) {
+    projection.ticket_id = String(record.ticketId || "");
+    projection.sku_code = String(record.skuCode || "");
+    projection.batch_no = String(record.batchNo || "");
+    projection.status = String(record.status || "");
+    projection.updated_at = String(record.updatedAt || "");
+  } else if (table === TABLES.scans) {
+    projection.ticket_id = record.ticketId ? String(record.ticketId) : null;
+    projection.waybill_no = String(record.waybillNo || "");
+    projection.sku_code = String(record.skuCode || "");
+    projection.batch_no = String(record.batchNo || "");
+    projection.status = String(record.status || "");
+    projection.actor_id = String(record.operatorId || "");
+    projection.updated_at = String(record.createdAt || "");
+  } else if (table === TABLES.users) {
+    projection.actor_id = String(record.id || "");
+    projection.actor_role = String(record.role || "");
+    projection.status = record.enabled === false ? "disabled" : "enabled";
+  }
+  return projection;
+}
+
+function ensureSqliteProjectionSchema(dbh: Database.Database) {
+  for (const table of Object.values(TABLES)) {
+    const rows = dbh.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+    const existing = new Set(rows.map((row) => row.name));
+    for (const column of PROJECTION_COLUMNS) {
+      if (!existing.has(column)) {
+        try {
+          dbh.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${column === "amount" || column === "version" ? "REAL" : "TEXT"}`);
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.includes("duplicate column")) throw error;
+        }
+      }
+    }
+  }
+  dbh.exec(`
+    CREATE INDEX IF NOT EXISTS idx_tickets_workbench ON ${TABLES.tickets} (status, assignee_id, source, type, waybill_no, due_at);
+    CREATE INDEX IF NOT EXISTS idx_tickets_batch_lock ON ${TABLES.tickets} (sku_code, batch_no, category, status);
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_approval_operation_key ON ${TABLES.approvals} (operation_key) WHERE operation_key IS NOT NULL AND operation_key != '';
+    CREATE INDEX IF NOT EXISTS idx_scans_ticket_batch ON ${TABLES.scans} (ticket_id, sku_code, batch_no, status);
+    CREATE INDEX IF NOT EXISTS idx_compensations_trace ON ${TABLES.compensations} (ticket_id, approval_id, direction);
+    CREATE INDEX IF NOT EXISTS idx_inventory_trace ON ${TABLES.inventory} (ticket_id, approval_id, sku_code, batch_no);
+    CREATE INDEX IF NOT EXISTS idx_locks_open_batch ON ${TABLES.inventoryLocks} (sku_code, batch_no, status);
+    CREATE INDEX IF NOT EXISTS idx_sync_logs_time ON ${TABLES.syncLogs} (updated_at, status);
+  `);
+  backfillSqliteProjections(dbh);
+}
+
+function backfillSqliteProjections(dbh: Database.Database) {
+  for (const table of Object.values(TABLES)) {
+    const rows = dbh.prepare(`SELECT id, data FROM ${table}`).all() as { id: string; data: string }[];
+    const stmt = dbh.prepare(`UPDATE ${table} SET ${PROJECTION_COLUMNS.map((column) => `${column} = ?`).join(", ")} WHERE id = ?`);
+    const tx = dbh.transaction((records: { id: string; data: string }[]) => {
+      for (const row of records) {
+        const value = JSON.parse(row.data);
+        const projection = projectRecord(table, value);
+        stmt.run(...PROJECTION_COLUMNS.map((column) => projection[column]), row.id);
+      }
+    });
+    tx(rows);
+  }
 }
 
 function loadTable<T>(table: string): T[] {
@@ -116,21 +261,29 @@ function saveRecord(table: string, id: string, value: unknown) {
 }
 
 function persistSave(op: Extract<PersistOp, { kind: "save" }>) {
+  const projection = projectRecord(op.table, op.value);
   if (usePostgres) {
     enqueuePgWrite(async () => {
       await ensurePostgres();
       await pg!.query(
-        `INSERT INTO ${tableSql(op.table)} (id, data, created_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at`,
-        [op.id, JSON.stringify(op.value), op.createdAt]
+        `INSERT INTO ${tableSql(op.table)} (
+           id, data, created_at, ${PROJECTION_COLUMNS.join(", ")}
+         )
+         VALUES (
+           $1, $2::jsonb, $3, ${PROJECTION_COLUMNS.map((_, index) => `$${index + 4}`).join(", ")}
+         )
+         ON CONFLICT (id) DO UPDATE SET
+           data = EXCLUDED.data,
+           created_at = EXCLUDED.created_at,
+           ${PROJECTION_COLUMNS.map((column) => `${column} = EXCLUDED.${column}`).join(", ")}`,
+        [op.id, JSON.stringify(op.value), op.createdAt, ...PROJECTION_COLUMNS.map((column) => projection[column])]
       );
     });
     return;
   }
   getSqlite()
-    .prepare(`INSERT OR REPLACE INTO ${op.table} (id, data, created_at) VALUES (?, ?, ?)`)
-    .run(op.id, JSON.stringify(op.value), op.createdAt);
+    .prepare(`INSERT OR REPLACE INTO ${op.table} (id, data, created_at, ${PROJECTION_COLUMNS.join(", ")}) VALUES (?, ?, ?, ${PROJECTION_COLUMNS.map(() => "?").join(", ")})`)
+    .run(op.id, JSON.stringify(op.value), op.createdAt, ...PROJECTION_COLUMNS.map((column) => projection[column]));
 }
 
 function deleteRecord(table: string, id: string) {
@@ -166,9 +319,12 @@ function seedRecords<T extends { id?: string; waybillNo?: string }>(
 ) {
   if (usePostgres) return;
   const dbh = getSqlite();
-  const stmt = dbh.prepare(`INSERT OR IGNORE INTO ${table} (id, data, created_at) VALUES (?, ?, ?)`);
+  const stmt = dbh.prepare(`INSERT OR IGNORE INTO ${table} (id, data, created_at, ${PROJECTION_COLUMNS.join(", ")}) VALUES (?, ?, ?, ${PROJECTION_COLUMNS.map(() => "?").join(", ")})`);
   const tx = dbh.transaction((records: T[]) => {
-    for (const item of records) stmt.run(idOf(item), JSON.stringify(item), now());
+    for (const item of records) {
+      const projection = projectRecord(table, item);
+      stmt.run(idOf(item), JSON.stringify(item), now(), ...PROJECTION_COLUMNS.map((column) => projection[column]));
+    }
   });
   tx(items);
 }
@@ -182,10 +338,41 @@ async function ensurePostgres() {
           `CREATE TABLE IF NOT EXISTS ${tableSql(table)} (
             id TEXT PRIMARY KEY,
             data JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            waybill_no TEXT,
+            ticket_id TEXT,
+            approval_id TEXT,
+            operation_key TEXT,
+            sku_code TEXT,
+            batch_no TEXT,
+            category TEXT,
+            source TEXT,
+            type TEXT,
+            status TEXT,
+            assignee_id TEXT,
+            assignee_role TEXT,
+            reporter_id TEXT,
+            actor_id TEXT,
+            actor_role TEXT,
+            direction TEXT,
+            amount NUMERIC,
+            version NUMERIC,
+            due_at TEXT,
+            updated_at TEXT
           )`
         );
+        for (const column of PROJECTION_COLUMNS) {
+          await pg.query(`ALTER TABLE ${tableSql(table)} ADD COLUMN IF NOT EXISTS ${column} ${column === "amount" || column === "version" ? "NUMERIC" : "TEXT"}`);
+        }
       }
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_tickets_workbench ON ${TABLES.tickets} (status, assignee_id, source, type, waybill_no, due_at)`);
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_tickets_batch_lock ON ${TABLES.tickets} (sku_code, batch_no, category, status)`);
+      await pg.query(`CREATE UNIQUE INDEX IF NOT EXISTS uniq_approval_operation_key ON ${TABLES.approvals} (operation_key) WHERE operation_key IS NOT NULL AND operation_key != ''`);
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_scans_ticket_batch ON ${TABLES.scans} (ticket_id, sku_code, batch_no, status)`);
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_compensations_trace ON ${TABLES.compensations} (ticket_id, approval_id, direction)`);
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_inventory_trace ON ${TABLES.inventory} (ticket_id, approval_id, sku_code, batch_no)`);
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_locks_open_batch ON ${TABLES.inventoryLocks} (sku_code, batch_no, status)`);
+      await pg.query(`CREATE INDEX IF NOT EXISTS idx_sync_logs_time ON ${TABLES.syncLogs} (updated_at, status)`);
     })();
   }
   await pgReady;
@@ -234,11 +421,19 @@ async function persistAtomicOps(ops: PersistOp[]) {
     await sql.transaction(
       ops.map((op) => {
         if (op.kind === "save") {
+          const projection = projectRecord(op.table, op.value);
           return sql.query(
-            `INSERT INTO ${tableSql(op.table)} (id, data, created_at)
-             VALUES ($1, $2::jsonb, $3)
-             ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, created_at = EXCLUDED.created_at`,
-            [op.id, JSON.stringify(op.value), op.createdAt]
+            `INSERT INTO ${tableSql(op.table)} (
+               id, data, created_at, ${PROJECTION_COLUMNS.join(", ")}
+             )
+             VALUES (
+               $1, $2::jsonb, $3, ${PROJECTION_COLUMNS.map((_, index) => `$${index + 4}`).join(", ")}
+             )
+             ON CONFLICT (id) DO UPDATE SET
+               data = EXCLUDED.data,
+               created_at = EXCLUDED.created_at,
+               ${PROJECTION_COLUMNS.map((column) => `${column} = EXCLUDED.${column}`).join(", ")}`,
+            [op.id, JSON.stringify(op.value), op.createdAt, ...PROJECTION_COLUMNS.map((column) => projection[column])]
           );
         }
         return sql.query(`DELETE FROM ${tableSql(op.table)} WHERE id = $1`, [op.id]);
@@ -248,15 +443,16 @@ async function persistAtomicOps(ops: PersistOp[]) {
   }
 
   const dbh = getSqlite();
-  const saveStmt = new Map<string, Database.Statement<[string, string, string]>>();
+  const saveStmt = new Map<string, Database.Statement>();
   const deleteStmt = new Map<string, Database.Statement<[string]>>();
   const tx = dbh.transaction((records: PersistOp[]) => {
     for (const op of records) {
       if (op.kind === "save") {
+        const projection = projectRecord(op.table, op.value);
         if (!saveStmt.has(op.table)) {
-          saveStmt.set(op.table, dbh.prepare(`INSERT OR REPLACE INTO ${op.table} (id, data, created_at) VALUES (?, ?, ?)`));
+          saveStmt.set(op.table, dbh.prepare(`INSERT OR REPLACE INTO ${op.table} (id, data, created_at, ${PROJECTION_COLUMNS.join(", ")}) VALUES (?, ?, ?, ${PROJECTION_COLUMNS.map(() => "?").join(", ")})`));
         }
-        saveStmt.get(op.table)!.run(op.id, JSON.stringify(op.value), op.createdAt);
+        saveStmt.get(op.table)!.run(op.id, JSON.stringify(op.value), op.createdAt, ...PROJECTION_COLUMNS.map((column) => projection[column]));
       } else {
         if (!deleteStmt.has(op.table)) {
           deleteStmt.set(op.table, dbh.prepare(`DELETE FROM ${op.table} WHERE id = ?`));
