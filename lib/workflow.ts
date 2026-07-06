@@ -219,11 +219,11 @@ export function approveTicket(params: {
 }) {
   const ticket = db().tickets.find((item) => item.id === params.ticketId);
   if (!ticket) return { ok: false, message: "工单不存在" };
+  if (db().approvals.some((item) => item.operationKey === params.operationKey)) return { ok: true, message: "重复操作已忽略", ticket };
   if (ticket.version !== params.expectedVersion) return { ok: false, message: "该工单已被处理，请刷新" };
   if (ticket.reporterId === params.actorId) return { ok: false, message: "上报人不能审批自己提交的工单" };
   if (!canApprove(params.actorRole, ticket.status)) return { ok: false, message: "当前角色无权审批该层级工单" };
   if (ticket.assigneeId && ticket.assigneeId !== params.actorId && params.actorRole !== "admin") return { ok: false, message: "该工单已分配给其他审批人" };
-  if (db().approvals.some((item) => item.operationKey === params.operationKey)) return { ok: true, message: "重复操作已忽略", ticket };
 
   const fromStatus = ticket.status;
   let toStatus: TicketStatus = "executing";
@@ -270,6 +270,7 @@ export function fastRelease(ticketId: string, actorId: string, actorRole: UserRo
   if (!ticket) return { ok: false, message: "工单不存在" };
   if (actorRole !== "qc_supervisor" && actorRole !== "admin") return { ok: false, message: "仅品控主管可快速放行" };
   if (ticket.category !== "quality") return { ok: false, message: "快速放行只适用于品控异常" };
+  if (ticket.status === "completed" || ticket.status === "closed") return { ok: true, message: "工单已关闭，无需重复放行", ticket };
   const fromStatus = ticket.status;
   ticket.status = "completed";
   ticket.version += 1;

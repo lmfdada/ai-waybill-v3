@@ -455,6 +455,14 @@ export function getSnapshot(waybillNo: string) {
   return store.snapshots.find((item) => item.waybillNo === waybillNo);
 }
 
+export function saveSnapshot(snapshot: WaybillSnapshot) {
+  const idx = store.snapshots.findIndex((item) => item.waybillNo === snapshot.waybillNo);
+  if (idx >= 0) store.snapshots[idx] = snapshot;
+  else store.snapshots.unshift(snapshot);
+  saveRecord(TABLES.snapshots, snapshot.waybillNo, snapshot);
+  return snapshot;
+}
+
 export function addSyncLog(log: Omit<SyncLog, "id" | "createdAt">) {
   const entry = { id: makeId("LOG"), createdAt: now(), ...log };
   store.syncLogs.unshift(entry);
@@ -513,6 +521,9 @@ export function ensureInventoryBatch(skuCode: string, batchNo: string) {
 }
 
 export function lockInventory(params: { ticketId: string; skuCode: string; batchNo: string; qty: number; reason: string }) {
+  const existing = store.inventoryLocks.find((item) => item.ticketId === params.ticketId && item.skuCode === params.skuCode && item.batchNo === params.batchNo && item.status === "locked");
+  if (existing) return existing;
+
   const batch = ensureInventoryBatch(params.skuCode, params.batchNo);
   const qty = Math.max(1, params.qty);
   batch.availableQty = Math.max(0, batch.availableQty - qty);
@@ -520,9 +531,6 @@ export function lockInventory(params: { ticketId: string; skuCode: string; batch
   batch.status = batch.lockedQty > 0 ? "locked" : "available";
   batch.updatedAt = now();
   saveInventoryBatch(batch);
-
-  const existing = store.inventoryLocks.find((item) => item.ticketId === params.ticketId && item.skuCode === params.skuCode && item.batchNo === params.batchNo && item.status === "locked");
-  if (existing) return existing;
 
   const lock: InventoryLock = {
     id: makeId("LOCK"),

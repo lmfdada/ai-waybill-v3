@@ -1,4 +1,4 @@
-import { addSyncLog, getSnapshot } from "./store";
+import { addSyncLog, getSnapshot, saveSnapshot } from "./store";
 import type { WaybillSnapshot } from "./types";
 
 type V2Result<T> = {
@@ -86,11 +86,13 @@ async function callV2<T>(endpoint: string, paramsDigest: string, fallback: () =>
 }
 
 export async function getWaybillFromV2(waybillNo: string) {
-  return callV2<WaybillSnapshot>(
+  const result = await callV2<WaybillSnapshot>(
     `/api/v2/waybills/${encodeURIComponent(waybillNo)}`,
     `waybillNo=${waybillNo}`,
     () => getSnapshot(waybillNo) || null
   );
+  if (result.data && result.source === "v2_realtime") saveSnapshot({ ...result.data, source: result.source, syncedAt: new Date().toISOString() });
+  return result;
 }
 
 export async function validateSkuFromV2(waybillNo: string, skuCode: string) {
@@ -104,6 +106,9 @@ export async function validateSkuFromV2(waybillNo: string, skuCode: string) {
       return { valid: !!sku, sku, waybill: snapshot || null };
     }
   );
+  if (direct.data?.waybill && direct.source === "v2_realtime") {
+    saveSnapshot({ ...direct.data.waybill, source: direct.source, syncedAt: new Date().toISOString() });
+  }
   if (direct.data) return direct;
 
   const result = await getWaybillFromV2(waybillNo);
